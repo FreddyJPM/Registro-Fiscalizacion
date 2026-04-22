@@ -114,58 +114,63 @@
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, addDoc, onSnapshot, query, deleteDoc, doc, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Configuración de Firebase
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
-
-        const plateInput = document.getElementById('placa');
-        const listContainer = document.getElementById('listaRegistros');
-        const counter = document.getElementById('contadorRegistros');
-        const inspectorDisplay = document.getElementById('displayInspector');
-        const btnReg = document.getElementById('btnRegistrar');
+        // --- MANEJO DE CONFIGURACIÓN ---
+        let db, auth, appId;
         const modal = document.getElementById('modalConfig');
+        const inspectorDisplay = document.getElementById('displayInspector');
         
-        let currentUser = null;
-        let inspectorName = "";
-        let registrosLocales = [];
-
-        // 1. Autenticación Inicial
-        const initAuth = async () => {
-            try {
-                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                    await signInWithCustomToken(auth, __initial_auth_token);
-                } else {
-                    await signInAnonymously(auth);
-                }
-            } catch (error) {
-                console.error("Error de autenticación:", error);
-            }
-        };
-
-        // Escuchar cambios de estado de autenticación
-        onAuthStateChanged(auth, (user) => {
-            if (user) {
-                currentUser = user;
-                verificarInspector();
-            } else {
-                initAuth();
-            }
-        });
-
-        const verificarInspector = () => {
+        // Función inmediata para mostrar el modal si no hay nombre guardado
+        const chequeoInicial = () => {
             const saved = localStorage.getItem('user_fiscal_global');
             if (!saved) {
                 modal.classList.add('active');
             } else {
-                modal.classList.remove('active');
-                inspectorName = saved;
-                inspectorDisplay.innerText = inspectorName;
-                iniciarSincronizacion();
+                inspectorDisplay.innerText = saved;
             }
         };
+        chequeoInicial();
+
+        try {
+            // Intentamos cargar la configuración de Firebase
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+            
+            if (firebaseConfig) {
+                const app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+                // Autenticación
+                const initAuth = async () => {
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                };
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        const savedName = localStorage.getItem('user_fiscal_global');
+                        if (savedName) iniciarSincronizacion(savedName);
+                    } else {
+                        initAuth();
+                    }
+                });
+            } else {
+                console.warn("Configuración de Firebase no detectada. El modo offline/preview está activo.");
+                inspectorDisplay.innerText = "Modo Local";
+            }
+        } catch (e) {
+            console.error("Error inicializando Firebase:", e);
+        }
+
+        const plateInput = document.getElementById('placa');
+        const listContainer = document.getElementById('listaRegistros');
+        const counter = document.getElementById('contadorRegistros');
+        const btnReg = document.getElementById('btnRegistrar');
+        
+        let registrosLocales = [];
 
         window.guardarConfiguracion = () => {
             const input = document.getElementById('nombreInspectorInput');
@@ -173,92 +178,74 @@
             if (name.length < 3) return alert("Por favor, ingrese su nombre completo.");
             
             localStorage.setItem('user_fiscal_global', name);
-            inspectorName = name;
             inspectorDisplay.innerText = name;
             modal.classList.remove('active');
-            iniciarSincronizacion();
+            if (auth && auth.currentUser) {
+                iniciarSincronizacion(name);
+            }
         };
 
-        // 2. Sincronización en Tiempo Real
-        const iniciarSincronizacion = () => {
-            if (!currentUser) return;
-            
+        const iniciarSincronizacion = (name) => {
+            if (!db) return;
             const dataCol = collection(db, 'artifacts', appId, 'public', 'data', 'intervenciones');
-            
             onSnapshot(dataCol, (snapshot) => {
                 const data = [];
                 snapshot.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
-                
                 data.sort((a, b) => b.timestamp - a.timestamp);
                 registrosLocales = data;
                 renderizar(data);
-            }, (error) => {
-                console.error("Error en sincronización:", error);
-            });
+            }, (err) => console.error("Error sync:", err));
         };
 
-        // 3. Guardar Registro
         window.guardarRegistroNube = async () => {
-            if (!currentUser) return alert("Esperando conexión...");
-            
+            const name = localStorage.getItem('user_fiscal_global');
+            if (!name) return modal.classList.add('active');
+            if (!db) return alert("Base de datos no disponible en este entorno.");
+
             btnReg.disabled = true;
             const nuevo = {
                 placa: plateInput.value,
                 tipo: document.getElementById('tipoInfraccion').value,
                 obs: document.getElementById('observacion').value || "Sin detalles",
                 hora: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                inspector: inspectorName,
+                inspector: name,
                 timestamp: Date.now()
             };
 
             try {
                 const dataCol = collection(db, 'artifacts', appId, 'public', 'data', 'intervenciones');
                 await addDoc(dataCol, nuevo);
-                
                 plateInput.value = '';
                 document.getElementById('observacion').value = '';
-                btnReg.disabled = true;
             } catch (e) {
-                alert("Error al guardar en la nube: " + e.message);
+                alert("Error: " + e.message);
                 btnReg.disabled = false;
             }
         };
 
-        // 4. Borrar Registro
         window.eliminarRegistroNube = async (id) => {
-            if (!confirm("¿Eliminar este registro para todos?")) return;
+            if (!confirm("¿Eliminar para todos?")) return;
             try {
                 const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'intervenciones', id);
                 await deleteDoc(docRef);
-            } catch (e) {
-                alert("Error al eliminar: " + e.message);
-            }
+            } catch (e) { alert(e.message); }
         };
 
         window.confirmarLimpiezaNube = async () => {
-            if (!confirm("⚠️ ADENCIÓN: Esto borrará la base de datos de TODOS los inspectores hoy. ¿Desea continuar?")) return;
+            if (!confirm("⚠️ Se borrará TODO de la base de datos compartida. ¿Continuar?")) return;
             try {
                 const dataCol = collection(db, 'artifacts', appId, 'public', 'data', 'intervenciones');
                 const snapshot = await getDocs(dataCol);
-                const deletePromises = snapshot.docs.map(d => deleteDoc(d.ref));
-                await Promise.all(deletePromises);
-                alert("Base de datos reiniciada.");
-            } catch (e) {
-                alert("Error al limpiar base de datos: " + e.message);
-            }
+                await Promise.all(snapshot.docs.map(d => deleteDoc(d.ref)));
+            } catch (e) { alert(e.message); }
         };
 
-        // Renderizado
         const renderizar = (data) => {
             counter.innerText = data.length;
             if (data.length === 0) {
-                listContainer.innerHTML = `
-                    <div class="text-center py-10">
-                        <p class="text-slate-400 text-[10px] font-bold uppercase tracking-widest italic">No hay intervenciones compartidas aún</p>
-                    </div>`;
+                listContainer.innerHTML = '<p class="text-center text-slate-400 py-10 text-[10px] font-bold uppercase tracking-widest">Sin registros compartidos</p>';
                 return;
             }
-
             listContainer.innerHTML = data.map(item => `
                 <div class="bg-white rounded-3xl p-5 border border-slate-100 card-shadow">
                     <div class="flex justify-between items-start">
@@ -275,9 +262,7 @@
                             <p class="text-[8px] font-bold text-blue-500 truncate max-w-[90px]">${item.inspector}</p>
                         </div>
                     </div>
-                    <p class="text-xs text-slate-500 mt-3 font-medium bg-slate-50 p-3 rounded-xl border border-slate-100 italic">
-                        "${item.obs}"
-                    </p>
+                    <p class="text-xs text-slate-500 mt-3 font-medium bg-slate-50 p-3 rounded-xl border border-slate-100 italic">"${item.obs}"</p>
                     <div class="flex justify-end mt-2">
                         <button onclick="eliminarRegistroNube('${item.id}')" class="text-slate-200 hover:text-red-500 transition-colors">
                             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
@@ -287,7 +272,6 @@
             `).join('');
         };
 
-        // Eventos de entrada
         plateInput.addEventListener('input', (e) => {
             let val = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
             if (val.length > 3) val = val.slice(0, 3) + '-' + val.slice(3, 6);
@@ -296,15 +280,13 @@
         });
 
         window.exportarCSV = () => {
-            if (registrosLocales.length === 0) return alert("No hay datos para exportar.");
+            if (registrosLocales.length === 0) return alert("No hay datos.");
             let csv = "\uFEFFHora,Placa,Resultado,Observacion,Inspector\n";
-            registrosLocales.forEach(r => {
-                csv += `"${r.hora}","${r.placa}","${r.tipo}","${r.obs.replace(/"/g, '""')}","${r.inspector}"\n`;
-            });
+            registrosLocales.forEach(r => csv += `"${r.hora}","${r.placa}","${r.tipo}","${r.obs.replace(/"/g, '""')}","${r.inspector}"\n`);
             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement("a");
             link.href = URL.createObjectURL(blob);
-            link.download = `Reporte_Global_${new Date().toISOString().slice(0,10)}.csv`;
+            link.download = `Reporte_Fiscal_${new Date().toISOString().slice(0,10)}.csv`;
             link.click();
         };
 
